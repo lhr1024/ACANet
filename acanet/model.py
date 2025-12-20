@@ -208,8 +208,11 @@ class ACANetConfig:
 
 
 # ----------------------------- 主模型 ----------------------------- #
-def _pad_to_multiple(x: Tensor, factor: int = 8) -> tuple[Tensor, tuple[int, int, int, int]]:
-    """将输入在 H/W 维度补齐到 factor 的倍数，并确保最小尺寸为 factor，避免多次下采样后尺寸为 0。"""
+def _pad_to_multiple(x: Tensor, factor: int = 16) -> tuple[Tensor, tuple[int, int, int, int]]:
+    """将输入在 H/W 维度补齐到 factor 的倍数，并确保最小尺寸为 factor，避免多次下采样后尺寸为 0。
+
+    采用 16 是因为网络包含 3 次 2x 下采样，16 / 2 / 2 / 2 = 2，仍大于 0，给出冗余安全边际。
+    """
 
     _, _, h, w = x.shape
     target_h = max(factor, ((h + factor - 1) // factor) * factor)
