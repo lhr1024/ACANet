@@ -1,11 +1,11 @@
 """简化的 ACANet 训练脚本，便于对照论文实验流程。
 
 运行方式：
-    python -m acanet.train --features data/X.npy --labels data/Y.npy
+    直接运行 python -m acanet.train
+    所有必填参数在下方 CONFIG_BLOCK 中集中配置（无需命令行必填参数）。
 """
 from __future__ import annotations
 
-import argparse
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
@@ -20,6 +20,23 @@ from .model import ACANet, ACANetConfig, count_parameters
 
 DEFAULT_FEATURES_PATH = "data/features"
 DEFAULT_LABELS_PATH = "data/labels"
+
+
+CONFIG_BLOCK = {
+    # 数据路径（可指向目录或单个 .npy）
+    "features": DEFAULT_FEATURES_PATH,
+    "labels": DEFAULT_LABELS_PATH,
+    # 训练超参
+    "batch_size": 4,
+    "epochs": 50,
+    "learning_rate": 1e-3,
+    "num_workers": 0,
+    # 模型配置
+    "num_classes": 4,
+    "base_channels": 32,
+    # 设备（GPU 环境下设置为 "cuda"，若无 GPU 可改为 "cpu"）
+    "device": "cuda",
+}
 
 
 @dataclass
@@ -122,30 +139,18 @@ def build_dataset_config(features: str | None, labels: str | None) -> NpyDataset
     return NpyDatasetConfig(features_path=feats, labels_path=labs)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train ACANet on .npy datasets")
-    parser.add_argument("--features", help=f"Path to features .npy or directory (default: {DEFAULT_FEATURES_PATH})")
-    parser.add_argument("--labels", help=f"Path to labels .npy or directory (default: {DEFAULT_LABELS_PATH})")
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--num-classes", type=int, default=4)
-    parser.add_argument("--base-channels", type=int, default=32)
-    parser.add_argument("--device", default="cpu")
-    return parser.parse_args()
-
-
 def main() -> None:  # pragma: no cover - CLI 入口
-    args = parse_args()
-    dataset_cfg = build_dataset_config(args.features, args.labels)
-    model_cfg = ACANetConfig(in_channels=4, num_classes=args.num_classes, base_channels=args.base_channels)
+    cfg = CONFIG_BLOCK
+    dataset_cfg = build_dataset_config(cfg["features"], cfg["labels"])
+    model_cfg = ACANetConfig(in_channels=4, num_classes=cfg["num_classes"], base_channels=cfg["base_channels"])
     train_cfg = TrainingConfig(
         dataset=dataset_cfg,
         model=model_cfg,
-        batch_size=args.batch_size,
-        num_epochs=args.epochs,
-        learning_rate=args.lr,
-        device=args.device,
+        batch_size=cfg["batch_size"],
+        num_epochs=cfg["epochs"],
+        learning_rate=cfg["learning_rate"],
+        num_workers=cfg["num_workers"],
+        device=cfg["device"],
     )
     fit(train_cfg)
 

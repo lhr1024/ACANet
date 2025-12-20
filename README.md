@@ -14,10 +14,14 @@
 - `acanet/metrics.py`：Dice/IoU 与混合损失。
 - `acanet/train.py`：训练/验证循环，多路损失求和。
 
-## 2. 依赖安装
+## 2. 依赖安装（GPU conda 环境示例）
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+# 创建并激活 conda 环境（需可用 CUDA 11.0）
+conda create -n acanet python=3.8 -y
+conda activate acanet
+# 安装指定版本的 GPU PyTorch
+conda install pytorch==1.7.1 torchvision==0.8.2 torchaudio==0.7.2 cudatoolkit=11.0 -c pytorch -y
+# 其余依赖
 pip install -r requirements.txt
 ```
 主要依赖：PyTorch、NumPy、SciPy、scikit-learn、rich（可选日志美化）。
