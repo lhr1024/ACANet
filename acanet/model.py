@@ -209,11 +209,13 @@ class ACANetConfig:
 
 # ----------------------------- 主模型 ----------------------------- #
 def _pad_to_multiple(x: Tensor, factor: int = 8) -> tuple[Tensor, tuple[int, int, int, int]]:
-    """将输入在 H/W 维度补齐到 factor 的倍数，避免多次下采样后尺寸为 0。"""
+    """将输入在 H/W 维度补齐到 factor 的倍数，并确保最小尺寸为 factor，避免多次下采样后尺寸为 0。"""
 
     _, _, h, w = x.shape
-    pad_h = (factor - h % factor) % factor
-    pad_w = (factor - w % factor) % factor
+    target_h = max(factor, ((h + factor - 1) // factor) * factor)
+    target_w = max(factor, ((w + factor - 1) // factor) * factor)
+    pad_h = target_h - h
+    pad_w = target_w - w
     pad = (0, pad_w, 0, pad_h)  # (left, right, top, bottom)
     if pad_h or pad_w:
         x = F.pad(x, pad, mode="replicate")
