@@ -288,8 +288,8 @@ class ACANet(nn.Module):
         if x.shape[1] < 4:
             raise ValueError("输入通道不足 4，无法按模态对分支")
 
-        # 记录原始尺寸并补齐到 8 的倍数，避免多次下采样后尺寸变为 0
-        x, pad = _pad_to_multiple(x, factor=8)
+        # 记录原始尺寸并补齐到 16 的倍数，避免多次下采样后尺寸变为 0
+        x, pad = _pad_to_multiple(x, factor=16)
 
         # 划分模态：上 (T1, T1CE)，下 (T2, FLAIR)
         x_up = x[:, :2]
