@@ -42,7 +42,7 @@ train_ds, val_ds = load_datasets(dataset_cfg)
 
 ## 5. 训练与验证
 ```bash
-python -m acanet.train --features data/features.npy --labels data/labels.npy \
+python -m acanet.train --features data/features --labels data/labels \
     --batch-size 4 --epochs 50 --lr 1e-3 --num-classes 4 --base-channels 32 --device cuda
 ```
 输出包含每个 epoch 的训练损失（含 `P_a/P_d/P_f` 三路）与验证 Dice/IoU，以及参数量，可对照论文表格。若追求论文设定，可将编码器替换为 PVTv2-B2，batch size=12，训练 100 轮，poly 学习率策略，BraTS 2D 切片。

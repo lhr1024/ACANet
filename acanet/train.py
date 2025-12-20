@@ -18,6 +18,10 @@ from .metrics import dice_coefficient, dice_loss, iou_score
 from .model import ACANet, ACANetConfig, count_parameters
 
 
+DEFAULT_FEATURES_PATH = "data/features"
+DEFAULT_LABELS_PATH = "data/labels"
+
+
 @dataclass
 class TrainingConfig:
     dataset: NpyDatasetConfig
@@ -110,10 +114,18 @@ def fit(config: TrainingConfig) -> Dict[str, float]:
     return history
 
 
+def build_dataset_config(features: str | None, labels: str | None) -> NpyDatasetConfig:
+    """根据传入路径或默认路径构建数据配置，便于显式设置特征/标签目录。"""
+
+    feats = features if features is not None else DEFAULT_FEATURES_PATH
+    labs = labels if labels is not None else DEFAULT_LABELS_PATH
+    return NpyDatasetConfig(features_path=feats, labels_path=labs)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train ACANet on .npy datasets")
-    parser.add_argument("--features", required=True, help="Path to features .npy")
-    parser.add_argument("--labels", required=True, help="Path to labels .npy")
+    parser.add_argument("--features", help=f"Path to features .npy or directory (default: {DEFAULT_FEATURES_PATH})")
+    parser.add_argument("--labels", help=f"Path to labels .npy or directory (default: {DEFAULT_LABELS_PATH})")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -125,7 +137,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:  # pragma: no cover - CLI 入口
     args = parse_args()
-    dataset_cfg = NpyDatasetConfig(features_path=args.features, labels_path=args.labels)
+    dataset_cfg = build_dataset_config(args.features, args.labels)
     model_cfg = ACANetConfig(in_channels=4, num_classes=args.num_classes, base_channels=args.base_channels)
     train_cfg = TrainingConfig(
         dataset=dataset_cfg,
