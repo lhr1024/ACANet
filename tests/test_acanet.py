@@ -7,15 +7,17 @@ from acanet.model import ACANet, ACANetConfig
 
 
 def test_model_forward_shapes():
-    config = ACANetConfig(in_channels=1, num_classes=3, base_channels=8)
+    config = ACANetConfig(in_channels=4, num_classes=3, base_channels=8)
     model = ACANet(config)
-    x = torch.randn(2, 1, 64, 64)
-    logits = model(x)
-    assert logits.shape == (2, 3, 64, 64)
+    x = torch.randn(2, 4, 64, 64)
+    outputs = model(x)
+    assert outputs["pf"].shape == (2, 3, 64, 64)
+    assert outputs["pa"].shape == (2, 3, 64, 64)
+    assert outputs["pd"].shape == (2, 3, 64, 64)
 
 
 def test_dataset_loading_and_split(tmp_path):
-    images = np.random.rand(10, 1, 32, 32).astype(np.float32)
+    images = np.random.rand(10, 4, 32, 32).astype(np.float32)
     labels = np.random.randint(0, 3, size=(10, 32, 32), dtype=np.int64)
     features_path = tmp_path / "features.npy"
     labels_path = tmp_path / "labels.npy"
@@ -27,7 +29,7 @@ def test_dataset_loading_and_split(tmp_path):
     assert len(train_ds) == 8
     assert len(val_ds) == 2
     x, y = train_ds[0]
-    assert x.shape == (1, 32, 32)
+    assert x.shape == (4, 32, 32)
     assert y.shape == (32, 32)
 
 

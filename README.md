@@ -1,17 +1,18 @@
-# ACANet 复现与说明
+# ACANet 复现（基于论文截图）
 
-本仓库给出论文中 ACANet（用于脑肿瘤分割）的核心结构梳理、可运行的 PyTorch 复现代码、依赖安装、测试用例与实验复现步骤。
+本仓库依据论文截图《Adaptive Context Aggregation Network With Prediction-Aware Decoding for Multimodal Brain Tumor Segmentation》（IEEE TIM 2024）梳理并复现 ACANet 的核心思想：双分支编码、预测感知区域探索（PRE）、自适应上下文聚合（ACA）和预测引导解码（PDS/PD）。为便于快速运行，编码器采用轻量 CNN 近似原文的 PVTv2-B2，但模块和公式对应关系保持一致。
 
-## 1. ACANet 核心算法结构
-- **编码器-解码器骨架**：整体沿用 U-Net 框架。编码端三层下采样提取多尺度特征；解码端逐层上采样并与跳跃特征融合。
-- **多尺度空洞上下文聚合（ACA）**：在瓶颈处使用多种扩张率的空洞卷积（默认膨胀率 1/3/5）提取不同感受野的特征后拼接，通过 1×1 卷积融合，再叠加通道注意力与空间注意力实现上下文自适应聚合。
-- **双重注意力跳跃融合**：解码阶段的跳跃连接先经过通道注意力和空间注意力门控，抑制无关区域，再与上采样特征拼接。
-- **损失与指标**：使用 Dice + 交叉熵混合损失，对照论文的分割目标函数；评估采用 Dice 与 IoU。
+## 1. 核心结构与论文公式对应
+- **双分支特征提取**：输入 4 个模态 (T1, T1CE, T2, FLAIR) 分为上下两路编码器，得到多尺度特征，并由部分解码器（PPD）输出暂态预测 `P_a`、`P_d`。
+- **Prediction-aware Region Exploration（PRE，公式 5/6）**：`P_H = (σ(P_a) + σ(P_d)) / 2` 提供候选肿瘤区域；`P_L = |σ(P_a) - σ(P_d)|` 提供边界/不确定区域。
+- **Adaptive Context Aggregation（ACA，公式 1-4）**：通道权重 `w1/w2` 融合两路特征，多尺度空洞卷积提取上下文，并用 `P_H` 引导，生成融合特征 `F_i`。
+- **Prediction-Guided Decoding（PD，公式 7/8）**：利用 `P_L` 逐层引导解码融合特征，输出最终预测 `P_f`；训练时对 `P_a`、`P_d`、`P_f` 同时监督（Dice+CE）。
+- **评估指标**：代码内置 Dice、IoU，可扩展 HD95、Sensitivity（论文使用）。
 
-对应实现位置：
-- `acanet/model.py`：`AtrousContextAggregation`（多尺度空洞+CA+SA），`DecoderBlock`（跳跃注意力），`ACANet`（整体骨架）。
+对应实现：
+- `acanet/model.py`：双分支编码、PPD、PRE、ACA、PD 以及多路输出。
 - `acanet/metrics.py`：Dice/IoU 与混合损失。
-- `acanet/train.py`：训练与验证流程。
+- `acanet/train.py`：训练/验证循环，多路损失求和。
 
 ## 2. 依赖安装
 ```bash
@@ -22,9 +23,9 @@ pip install -r requirements.txt
 主要依赖：PyTorch、NumPy、SciPy、scikit-learn、rich（可选日志美化）。
 
 ## 3. 数据格式与划分
-- 特征：`features.npy`，形状 `(N, C, H, W)`，C 通常为 1（单模态）或多模态堆叠。
-- 标签：`labels.npy`，形状 `(N, H, W)`，像素值为 `[0, num_classes-1]`。
-- 划分：`acanet/data.py` 使用 `train_test_split` 默认 8:2 划分，可通过 `test_size` 与 `random_state` 控制。
+- 特征：`features.npy`，形状 `(N, 4, H, W)`，通道顺序为 T1、T1CE、T2、FLAIR；通道不足将报错。
+- 标签：`labels.npy`，形状 `(N, H, W)`，像素值范围 `[0, num_classes-1]`。
+- 划分：`acanet/data.py` 使用 `train_test_split` 默认 8:2，可通过 `test_size`、`random_state` 调整。
 
 ## 4. 核心代码示例
 ```python
@@ -32,40 +33,32 @@ from acanet.model import ACANet, ACANetConfig
 from acanet.data import NpyDatasetConfig, load_datasets
 from acanet.metrics import dice_loss, dice_coefficient
 
-model_cfg = ACANetConfig(in_channels=1, num_classes=4)
+model_cfg = ACANetConfig(in_channels=4, num_classes=4)
 model = ACANet(model_cfg)
 
-# 读取数据
 dataset_cfg = NpyDatasetConfig(features_path="data/features.npy", labels_path="data/labels.npy")
 train_ds, val_ds = load_datasets(dataset_cfg)
 ```
 
-## 5. 运行训练与验证步骤
-1. 准备 `features.npy` 与 `labels.npy`（可用论文中的预处理方式生成）。
-2. 安装依赖并启动虚拟环境。
-3. 运行训练脚本：
-   ```bash
-   python -m acanet.train --features data/features.npy --labels data/labels.npy \
-       --batch-size 4 --epochs 50 --lr 1e-3 --num-classes 4 --base-channels 32 --device cuda
-   ```
-   输出包含每个 epoch 的训练损失、验证 Dice/IoU 以及参数量，便于和论文表格对比。
-4. 若需修改网络宽度/扩张率，可调整 `ACANetConfig` 中的 `base_channels` 与 `dilations`。
+## 5. 训练与验证
+```bash
+python -m acanet.train --features data/features.npy --labels data/labels.npy \
+    --batch-size 4 --epochs 50 --lr 1e-3 --num-classes 4 --base-channels 32 --device cuda
+```
+输出包含每个 epoch 的训练损失（含 `P_a/P_d/P_f` 三路）与验证 Dice/IoU，以及参数量，可对照论文表格。若追求论文设定，可将编码器替换为 PVTv2-B2，batch size=12，训练 100 轮，poly 学习率策略，BraTS 2D 切片。
 
-## 6. 测试用例
-使用内置的合成数据测试前向、数据加载与指标范围：
+## 6. 测试
+使用合成数据的快速单元测试：
 ```bash
 pytest -q
 ```
 
-## 7. 与论文实验的对比方法
-- **参数量**：训练结束会打印 `Trainable parameters`，可与论文报告的模型规模核对。
-- **指标对齐**：脚本输出的验证 Dice/IoU 即论文常用指标。如需精确复现，确保：
-  - 使用与论文一致的预处理、类别划分与数据分割方式；
-  - 训练轮数、学习率策略、损失权重与论文保持一致；
-  - 若论文采用 3D 体数据，将卷积/池化/反卷积替换为 3D 版本即可。
-- **消融验证**：可在 `AtrousContextAggregation` 中调整 `dilations`，或在 `DecoderBlock` 去掉注意力以复现实验对照组。
+## 7. 与论文对比/消融
+- **模块对齐**：PRE (5/6)、ACA (1-4)、PD (7/8) 均已实现；可禁用 ACA（直接 concat）、或将 `P_H/P_L` 置为常数 1 做消融。
+- **指标扩展**：若需 HD95、Sensitivity，可在 `metrics.py` 增加；保持与论文一致的数据预处理、切片策略与训练轮次。
+- **编码器替换**：为匹配论文，可将 `SimpleEncoder` 换成 PVTv2-B2 双分支，保持下游模块不变。
 
-## 8. 边界情况处理
-- 数据文件不存在或形状异常时会抛出清晰错误。
-- 空批次或标签数不足会触发验证逻辑，避免静默失败。
-- 输入维度不符（非 NCHW）时前向会提示具体形状错误。
+## 8. 边界处理
+- 输入维度、通道不足或空数据时会抛出明确错误。
+- 数据划分为空批次会报错防止静默失败。
+- 前向、损失均在多路输出上做维度/类型检查。 

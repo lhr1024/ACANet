@@ -58,8 +58,14 @@ def train_one_epoch(
         images, labels = batch
         images, labels = images.to(device), labels.to(device)
         optimizer.zero_grad()
-        logits = model(images)
-        loss = dice_loss(logits, labels, num_classes=num_classes)
+        outputs = model(images)
+        pa, pd, pf = outputs["pa"], outputs["pd"], outputs["pf"]
+        # 混合损失：对 Pa、Pd、Pf 分别计算 Dice+CE，累加
+        loss = (
+            dice_loss(pa, labels, num_classes=num_classes)
+            + dice_loss(pd, labels, num_classes=num_classes)
+            + dice_loss(pf, labels, num_classes=num_classes)
+        )
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
@@ -75,9 +81,10 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, num_cla
     with torch.no_grad():
         for images, labels in loader:
             images, labels = images.to(device), labels.to(device)
-            logits = model(images)
-            total_dice += dice_coefficient(logits, labels, num_classes=num_classes).item()
-            total_iou += iou_score(logits, labels, num_classes=num_classes).item()
+            outputs = model(images)
+            pf = outputs["pf"]
+            total_dice += dice_coefficient(pf, labels, num_classes=num_classes).item()
+            total_iou += iou_score(pf, labels, num_classes=num_classes).item()
             total_batches += 1
     denom = max(total_batches, 1)
     return {"dice": total_dice / denom, "iou": total_iou / denom}
@@ -119,7 +126,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:  # pragma: no cover - CLI 入口
     args = parse_args()
     dataset_cfg = NpyDatasetConfig(features_path=args.features, labels_path=args.labels)
-    model_cfg = ACANetConfig(in_channels=1, num_classes=args.num_classes, base_channels=args.base_channels)
+    model_cfg = ACANetConfig(in_channels=4, num_classes=args.num_classes, base_channels=args.base_channels)
     train_cfg = TrainingConfig(
         dataset=dataset_cfg,
         model=model_cfg,

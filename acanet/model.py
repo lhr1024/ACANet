@@ -1,117 +1,41 @@
-"""ACANet 模型实现。
+"""ACANet 模型复现（基于论文截图梳理的核心结构）。
 
-本文件根据论文中描述的 ACANet 框架进行 Python 复现：
-- 采用编码器-解码器结构（对应论文的整体公式 F = D(E(X))）。
-- 在编码阶段使用多尺度空洞卷积聚合（对应论文的上下文聚合公式）。
-- 在跳跃连接处加入通道/空间注意力（对应论文的自适应注意力权重计算公式）。
+核心组件（对应论文图 1、图 2、图 3、公式 (1)-(8)）：
+1) 双分支特征提取：上支路(T1/T1CE)与下支路(T2/FLAIR)分别编码，得到多层特征与各自的暂态预测 P_a、P_d（通过部分解码器 PPD）。
+2) 预测感知区域探索 PRE：由 P_a、P_d 得到全局候选区域 P_H（公式 (5)）和边界/不确定区域 P_L（公式 (6)）。
+3) 自适应上下文聚合 ACA：利用 P_H 引导对齐后的多模态特征融合，使用通道权重 w_1, w_2（公式 (1)、(2)）和多尺度卷积（公式 (3)、(4)）生成融合特征 F_i。
+4) 预测引导解码 PDS（含 PD）：使用 P_L 逐层引导解码融合特征 F_i，生成最终预测 P_f（公式 (7)、(8)）。
 
-实现假设输入为二维分割（N, C, H, W），便于快速复现和测试。如果需要 3D，
-仅需将 Conv2d/BatchNorm2d/MaxPool2d 改为 3D 版本并调整卷积核尺寸。
+为便于复现与测试，这里使用轻量卷积编码器替代原文的 PVTv2-B2，但保留双分支、ACA、PRE、PD 的设计思想与公式对应关系。
+输入假设为 (N, 4, H, W)，按论文分成两对模态：上支路 (T1, T1CE)，下支路 (T2, FLAIR)。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import Dict, List, Sequence
 
 import torch
 from torch import Tensor, nn
+import torch.nn.functional as F
 
 
+# ----------------------------- 基础模块 ----------------------------- #
 class ConvBNReLU(nn.Sequential):
-    """基础卷积模块，对应论文中最底层的特征提取公式。
+    """3x3 卷积 + BN + ReLU."""
 
-    该模块实现 (Conv -> BN -> ReLU)，可在多个位置复用。
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int = 3,
-        padding: Optional[int] = None,
-        dilation: int = 1,
-    ) -> None:
-        if padding is None:
-            padding = kernel_size // 2 * dilation
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, stride: int = 1):
+        padding = kernel_size // 2
         super().__init__(
-            nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding, dilation=dilation, bias=False),
+            nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
         )
 
 
-class ChannelAttention(nn.Module):
-    """通道注意力，对应论文的通道权重归一化公式（soft attention）。"""
-
-    def __init__(self, channels: int, reduction: int = 16) -> None:
-        super().__init__()
-        hidden = max(channels // reduction, 1)
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.mlp = nn.Sequential(
-            nn.Conv2d(channels, hidden, kernel_size=1, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden, channels, kernel_size=1, bias=True),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        weights = self.mlp(self.pool(x))  # 通道权重 α_c
-        return x * weights
-
-
-class SpatialAttention(nn.Module):
-    """空间注意力，对应论文的空间权重分布公式。"""
-
-    def __init__(self, kernel_size: int = 7) -> None:
-        super().__init__()
-        padding = kernel_size // 2
-        # 聚合通道信息后生成空间掩码
-        self.compress = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=padding, bias=False)
-        self.activation = nn.Sigmoid()
-
-    def forward(self, x: Tensor) -> Tensor:
-        max_pool = torch.max(x, dim=1, keepdim=True).values
-        mean_pool = torch.mean(x, dim=1, keepdim=True)
-        pooled = torch.cat([max_pool, mean_pool], dim=1)
-        mask = self.activation(self.compress(pooled))  # 空间权重 β_(h,w)
-        return x * mask
-
-
-class AtrousContextAggregation(nn.Module):
-    """多尺度空洞卷积上下文聚合模块（ACA）。
-
-    该模块对应论文中的上下文编码公式：使用多种扩张率提取局部与全局特征，
-    然后通过逐像素加权的注意力进行融合。
-    """
-
-    def __init__(self, channels: int, dilations: Sequence[int] = (1, 3, 5)) -> None:
-        super().__init__()
-        self.branches = nn.ModuleList(
-            [ConvBNReLU(channels, channels, kernel_size=3, dilation=d, padding=d) for d in dilations]
-        )
-        self.fuse = nn.Conv2d(len(dilations) * channels, channels, kernel_size=1, bias=False)
-        self.norm = nn.BatchNorm2d(channels)
-        self.act = nn.ReLU(inplace=True)
-        self.channel_attn = ChannelAttention(channels)
-        self.spatial_attn = SpatialAttention()
-
-    def forward(self, x: Tensor) -> Tensor:
-        if x.numel() == 0:
-            raise ValueError("Input to AtrousContextAggregation is empty")
-        features = [branch(x) for branch in self.branches]
-        concat = torch.cat(features, dim=1)
-        fused = self.fuse(concat)
-        fused = self.act(self.norm(fused))
-        # 自适应注意力融合，对应论文的 γ = σ(CA + SA)
-        fused = self.channel_attn(fused)
-        fused = self.spatial_attn(fused)
-        return fused
-
-
 class EncoderBlock(nn.Module):
-    """编码器块：两层卷积 + 下采样，模拟论文中自下而上的特征抽取。"""
+    """两层卷积 + 下采样，用于逐层提取特征。"""
 
-    def __init__(self, in_channels: int, out_channels: int) -> None:
+    def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
         self.conv = nn.Sequential(ConvBNReLU(in_channels, out_channels), ConvBNReLU(out_channels, out_channels))
         self.pool = nn.MaxPool2d(2)
@@ -122,115 +46,238 @@ class EncoderBlock(nn.Module):
         return feat, down
 
 
-class DecoderBlock(nn.Module):
-    """解码器块：上采样 + 跳跃注意力融合 + 卷积，还原分割分辨率。"""
+class SimpleEncoder(nn.Module):
+    """轻量级编码器（替代原文 PVTv2-B2，用于示意复现）。
 
-    def __init__(self, in_channels: int, skip_channels: int, out_channels: int) -> None:
-        super().__init__()
-        self.upsample = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
-        self.skip_attn = nn.Sequential(ChannelAttention(skip_channels), SpatialAttention())
-        self.conv = nn.Sequential(
-            ConvBNReLU(out_channels + skip_channels, out_channels),
-            ConvBNReLU(out_channels, out_channels),
-        )
-
-    def forward(self, x: Tensor, skip: Tensor) -> Tensor:
-        x = self.upsample(x)
-        if x.shape[-2:] != skip.shape[-2:]:
-            # 对齐尺寸，防止奇数尺寸导致的边界错位
-            diff_h = skip.shape[-2] - x.shape[-2]
-            diff_w = skip.shape[-1] - x.shape[-1]
-            x = nn.functional.pad(x, (diff_w // 2, diff_w - diff_w // 2, diff_h // 2, diff_h - diff_h // 2))
-        skip = self.skip_attn(skip)
-        fused = torch.cat([x, skip], dim=1)
-        return self.conv(fused)
-
-
-@dataclass
-class ACANetConfig:
-    """可配置参数，便于测试不同宽度与类别数。"""
-
-    in_channels: int = 1
-    num_classes: int = 4
-    base_channels: int = 32
-    dilations: Sequence[int] = (1, 3, 5)
-
-    def validate(self) -> None:
-        if self.in_channels <= 0:
-            raise ValueError("in_channels must be positive")
-        if self.num_classes <= 1:
-            raise ValueError("num_classes must be >= 2 for segmentation")
-        if self.base_channels <= 0:
-            raise ValueError("base_channels must be positive")
-        if len(self.dilations) == 0:
-            raise ValueError("dilations must be non-empty")
-
-
-class ACANet(nn.Module):
-    """ACANet 主体网络。
-
-    流程：
-    1) 编码器获取多尺度特征。
-    2) 最底层通过 AtrousContextAggregation 聚合上下文。
-    3) 解码器利用注意力筛选的跳跃连接恢复分辨率。
-    4) 最终 1x1 卷积生成分割 logits，对应论文的预测公式 P = softmax(W * F).
+    返回三个尺度的特征列表 [F1, F2, F3]，从浅到深。
     """
 
-    def __init__(self, config: ACANetConfig) -> None:
+    def __init__(self, in_channels: int, base: int = 32):
+        super().__init__()
+        self.stem = ConvBNReLU(in_channels, base)
+        self.enc1 = EncoderBlock(base, base)
+        self.enc2 = EncoderBlock(base, base * 2)
+        self.enc3 = EncoderBlock(base * 2, base * 4)
+
+    def forward(self, x: Tensor) -> List[Tensor]:
+        x = self.stem(x)
+        f1, x = self.enc1(x)  # H/2
+        f2, x = self.enc2(x)  # H/4
+        f3, _ = self.enc3(x)  # H/8
+        return [f1, f2, f3]
+
+
+# ----------------------------- 预测感知模块 ----------------------------- #
+class PartialPredictionDecoder(nn.Module):
+    """部分解码器（PPD），从单分支顶层特征生成暂态预测。
+
+    这里用浅层上采样路径近似论文中的分支解码器，输出大小与输入原图一致。
+    """
+
+    def __init__(self, channels: Sequence[int], num_classes: int):
+        super().__init__()
+        c1, c2, c3 = channels  # 对应 F1, F2, F3
+        self.up3 = nn.ConvTranspose2d(c3, c2, kernel_size=2, stride=2)
+        self.conv2 = ConvBNReLU(c2 * 2, c2)
+        self.up2 = nn.ConvTranspose2d(c2, c1, kernel_size=2, stride=2)
+        self.conv1 = ConvBNReLU(c1 * 2, c1)
+        self.classifier = nn.Conv2d(c1, num_classes, kernel_size=1)
+
+    def forward(self, features: List[Tensor]) -> Tensor:
+        f1, f2, f3 = features  # 低 -> 高
+        x = self.up3(f3)
+        if x.shape[-2:] != f2.shape[-2:]:
+            x = F.interpolate(x, size=f2.shape[-2:], mode="bilinear", align_corners=False)
+        x = self.conv2(torch.cat([x, f2], dim=1))
+        x = self.up2(x)
+        if x.shape[-2:] != f1.shape[-2:]:
+            x = F.interpolate(x, size=f1.shape[-2:], mode="bilinear", align_corners=False)
+        x = self.conv1(torch.cat([x, f1], dim=1))
+        return self.classifier(x)
+
+
+class PREModule(nn.Module):
+    """Prediction-aware Region Exploration（公式 (5)、(6)）。
+
+    P_H = σ(P_a) + σ(P_d) / 2   （候选肿瘤区域，覆盖 WT）
+    P_L = |σ(P_a) - σ(P_d)|     （边界/不确定区域）
+    """
+
+    def forward(self, pa: Tensor, pd: Tensor) -> tuple[Tensor, Tensor]:
+        pa_sig = torch.sigmoid(pa)
+        pd_sig = torch.sigmoid(pd)
+        ph = (pa_sig + pd_sig) / 2
+        pl = torch.abs(pa_sig - pd_sig)
+        return ph, pl
+
+
+# ----------------------------- ACA 模块 ----------------------------- #
+class ACAModule(nn.Module):
+    """自适应上下文聚合（公式 (1)-(4)）。
+
+    1) w1 = σ(conv3(F_u))，w2 = σ(conv3(F_d))            —— 公式 (1)、(2)
+    2) F̃ = w1 * F_u + w2 * F_d                          —— 融合权重
+    3) 多尺度空洞卷积抽取 F̃_u, F̃_d                     —— 公式 (3)、(4) 的 multi-scale conv
+    4) 拼接 [F̃_u * P_H, F̃_d * P_H, F̃] 后 3x3 卷积得到 F_i
+    """
+
+    def __init__(self, channels: int, dilations: Sequence[int] = (1, 3, 5, 7)):
+        super().__init__()
+        self.wu = nn.Sequential(nn.Conv2d(channels, channels, 3, padding=1, bias=False), nn.Sigmoid())
+        self.wd = nn.Sequential(nn.Conv2d(channels, channels, 3, padding=1, bias=False), nn.Sigmoid())
+        self.ms_u = nn.ModuleList(
+            [nn.Conv2d(channels, channels, 3, padding=d, dilation=d, bias=False) for d in dilations]
+        )
+        self.ms_d = nn.ModuleList(
+            [nn.Conv2d(channels, channels, 3, padding=d, dilation=d, bias=False) for d in dilations]
+        )
+        self.fuse = ConvBNReLU(channels * 3, channels)
+
+    def _multi_scale(self, x: Tensor, convs: nn.ModuleList) -> Tensor:
+        feats = [conv(x) for conv in convs]
+        return sum(feats) / len(feats)
+
+    def forward(self, fu: Tensor, fd: Tensor, ph: Tensor) -> Tensor:
+        if fu.numel() == 0 or fd.numel() == 0:
+            raise ValueError("ACA 输入特征为空")
+        # 权重 (1)(2)
+        wu = self.wu(fu)
+        wd = self.wd(fd)
+        f_tilde = wu * fu + wd * fd
+
+        # 多尺度卷积 (3)(4)
+        fu_ms = self._multi_scale(fu, self.ms_u)
+        fd_ms = self._multi_scale(fd, self.ms_d)
+
+        # 结合 P_H 引导，强调候选肿瘤区域
+        fu_guided = fu_ms * ph
+        fd_guided = fd_ms * ph
+
+        fused = torch.cat([fu_guided, fd_guided, f_tilde], dim=1)
+        return self.fuse(fused)
+
+
+# ----------------------------- 预测引导解码 PDS ----------------------------- #
+class PredictionGuidedDecoder(nn.Module):
+    """使用 P_L 逐层解码融合特征（对应公式 (7)、(8) 思路简化实现）。"""
+
+    def __init__(self, channels: Sequence[int], num_classes: int):
+        super().__init__()
+        c1, c2, c3 = channels
+        self.conv3 = ConvBNReLU(c3, c3)
+        self.up3 = nn.ConvTranspose2d(c3, c2, 2, 2)
+        self.conv2 = ConvBNReLU(c2 + c2, c2)  # concat PL 引导
+        self.up2 = nn.ConvTranspose2d(c2, c1, 2, 2)
+        self.conv1 = ConvBNReLU(c1 + c1, c1)
+        self.classifier = nn.Conv2d(c1, num_classes, kernel_size=1)
+
+    def forward(self, feats: List[Tensor], pl: Tensor) -> Tensor:
+        f1, f2, f3 = feats
+        x = self.conv3(f3)
+        x = self.up3(x)
+        if x.shape[-2:] != f2.shape[-2:]:
+            x = F.interpolate(x, size=f2.shape[-2:], mode="bilinear", align_corners=False)
+        pl2 = F.interpolate(pl, size=f2.shape[-2:], mode="bilinear", align_corners=False)
+        x = self.conv2(torch.cat([x, pl2], dim=1))
+
+        x = self.up2(x)
+        if x.shape[-2:] != f1.shape[-2:]:
+            x = F.interpolate(x, size=f1.shape[-2:], mode="bilinear", align_corners=False)
+        pl1 = F.interpolate(pl, size=f1.shape[-2:], mode="bilinear", align_corners=False)
+        x = self.conv1(torch.cat([x, pl1], dim=1))
+        return self.classifier(x)
+
+
+# ----------------------------- 配置 ----------------------------- #
+@dataclass
+class ACANetConfig:
+    in_channels: int = 4  # 按论文 4 个模态
+    num_classes: int = 4  # WT/TC/ET/背景
+    base_channels: int = 32
+    dilations: Sequence[int] = (1, 3, 5, 7)
+
+    def validate(self) -> None:
+        if self.in_channels < 4:
+            raise ValueError("需要至少 4 个通道（T1, T1CE, T2, FLAIR）")
+        if self.num_classes < 2:
+            raise ValueError("num_classes 必须 >=2")
+        if self.base_channels <= 0:
+            raise ValueError("base_channels 必须为正")
+        if len(self.dilations) == 0:
+            raise ValueError("dilations 不能为空")
+
+
+# ----------------------------- 主模型 ----------------------------- #
+class ACANet(nn.Module):
+    """ACANet 主体：双分支编码 -> PPD -> PRE -> ACA -> PD."""
+
+    def __init__(self, config: ACANetConfig):
         super().__init__()
         config.validate()
         ch = config.base_channels
-        self.enc1 = EncoderBlock(config.in_channels, ch)
-        self.enc2 = EncoderBlock(ch, ch * 2)
-        self.enc3 = EncoderBlock(ch * 2, ch * 4)
 
-        self.bottleneck = nn.Sequential(
-            ConvBNReLU(ch * 4, ch * 8),
-            AtrousContextAggregation(ch * 8, dilations=config.dilations),
-        )
+        # 双分支编码
+        self.encoder_up = SimpleEncoder(in_channels=2, base=ch)
+        self.encoder_down = SimpleEncoder(in_channels=2, base=ch)
 
-        self.dec3 = DecoderBlock(ch * 8, ch * 4, ch * 4)
-        self.dec2 = DecoderBlock(ch * 4, ch * 2, ch * 2)
-        self.dec1 = DecoderBlock(ch * 2, ch, ch)
+        # 部分解码器（生成 Pa, Pd）
+        channels = [ch, ch * 2, ch * 4]
+        self.ppd_up = PartialPredictionDecoder(channels, num_classes=config.num_classes)
+        self.ppd_down = PartialPredictionDecoder(channels, num_classes=config.num_classes)
 
-        self.classifier = nn.Conv2d(ch, config.num_classes, kernel_size=1)
+        # ACA 多尺度融合（逐层）
+        self.aca1 = ACAModule(ch, config.dilations)
+        self.aca2 = ACAModule(ch * 2, config.dilations)
+        self.aca3 = ACAModule(ch * 4, config.dilations)
 
-    def forward(self, x: Tensor) -> Tensor:
+        # 预测引导解码
+        self.pd = PredictionGuidedDecoder(channels, num_classes=config.num_classes)
+
+    def forward(self, x: Tensor) -> Dict[str, Tensor]:
         if x.dim() != 4:
-            raise ValueError(f"Expected 4D tensor (N, C, H, W), got {x.shape}")
-        x1, down1 = self.enc1(x)
-        x2, down2 = self.enc2(down1)
-        x3, down3 = self.enc3(down2)
+            raise ValueError(f"期望输入维度 (N, C, H, W)，实际 {x.shape}")
+        if x.shape[1] < 4:
+            raise ValueError("输入通道不足 4，无法按模态对分支")
 
-        bottleneck = self.bottleneck(down3)
-        d3 = self.dec3(bottleneck, x3)
-        d2 = self.dec2(d3, x2)
-        d1 = self.dec1(d2, x1)
-        logits = self.classifier(d1)
-        return logits
+        # 划分模态：上 (T1, T1CE)，下 (T2, FLAIR)
+        x_up = x[:, :2]
+        x_down = x[:, 2:4]
+
+        feats_up = self.encoder_up(x_up)
+        feats_down = self.encoder_down(x_down)
+
+        # 暂态预测（Pa, Pd）
+        pa = self.ppd_up(feats_up)
+        pd = self.ppd_down(feats_down)
+
+        # PRE 生成 P_H, P_L
+        ph, pl = PREModule()(pa, pd)
+
+        # ACA 融合多模态特征（逐层对应公式 (1)-(4)）
+        f1 = self.aca1(feats_up[0], feats_down[0], ph)
+        f2 = self.aca2(feats_up[1], feats_down[1], ph)
+        f3 = self.aca3(feats_up[2], feats_down[2], ph)
+        fused_feats = [f1, f2, f3]
+
+        # 预测引导解码（公式 (7)-(8) 简化）
+        pf = self.pd(fused_feats, pl)
+
+        return {"pa": pa, "pd": pd, "pf": pf, "ph": ph, "pl": pl}
 
 
 def count_parameters(model: nn.Module) -> int:
-    """统计可训练参数数量，方便与论文报告对比。"""
+    """统计可训练参数数量。"""
 
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def demo_forward() -> Tensor:
-    """用于快速单元测试的前向示例。"""
+def demo_forward() -> Dict[str, Tensor]:
+    """快速前向示例。"""
 
-    config = ACANetConfig()
-    model = ACANet(config)
-    dummy = torch.randn(2, config.in_channels, 128, 128)
+    cfg = ACANetConfig()
+    model = ACANet(cfg)
+    dummy = torch.randn(2, cfg.in_channels, 128, 128)
     return model(dummy)
 
 
-__all__ = [
-    "ACANet",
-    "ACANetConfig",
-    "AtrousContextAggregation",
-    "ChannelAttention",
-    "SpatialAttention",
-    "count_parameters",
-    "demo_forward",
-]
+__all__ = ["ACANet", "ACANetConfig", "count_parameters", "demo_forward"]
