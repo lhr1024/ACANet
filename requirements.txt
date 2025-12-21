@@ -1,0 +1,12 @@
+# Core scientific stack
+numpy>=1.24
+scipy>=1.10
+scikit-learn>=1.2
+# Deep learning backend (版本以 conda 安装为准，此处保持最低兼容)
+torch==1.7.1
+torchvision==0.8.2
+torchaudio==0.7.2
+# Optional for progress bars / logging
+rich>=13.7
+tqdm>=4.66
+matplotlib>=3.8
