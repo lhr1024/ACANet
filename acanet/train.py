@@ -6,17 +6,18 @@
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
 import torch
-from torch import Tensor, nn
+from torch import nn
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
 
 from .data import NpyDatasetConfig, load_datasets
-from .metrics import dice_coefficient, dice_loss, iou_score
+from .metrics import brats_dice_iou, dice_loss
 from .model import ACANet, ACANetConfig, count_parameters
 
 
@@ -118,21 +119,45 @@ def train_one_epoch(
 
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, num_classes: int) -> Dict[str, float]:
     model.eval()
-    total_dice = 0.0
-    total_iou = 0.0
+    totals = {
+        "loss": 0.0,
+        "dice": 0.0,
+        "iou": 0.0,
+        "dice_wt": 0.0,
+        "dice_tc": 0.0,
+        "dice_et": 0.0,
+        "iou_wt": 0.0,
+        "iou_tc": 0.0,
+        "iou_et": 0.0,
+    }
     total_batches = 0
     with torch.no_grad():
         for images, labels in loader:
             images, labels = images.to(device), labels.to(device)
             outputs = model(images)
-            pf = outputs["pf"]
+            pa, pd, pf = outputs["pa"], outputs["pd"], outputs["pf"]
             if pf.shape[-2:] != labels.shape[-2:]:
+                pa = nn.functional.interpolate(pa, size=labels.shape[-2:], mode="bilinear", align_corners=False)
+                pd = nn.functional.interpolate(pd, size=labels.shape[-2:], mode="bilinear", align_corners=False)
                 pf = nn.functional.interpolate(pf, size=labels.shape[-2:], mode="bilinear", align_corners=False)
-            total_dice += dice_coefficient(pf, labels, num_classes=num_classes).item()
-            total_iou += iou_score(pf, labels, num_classes=num_classes).item()
+            loss = (
+                dice_loss(pa, labels, num_classes=num_classes)
+                + dice_loss(pd, labels, num_classes=num_classes)
+                + dice_loss(pf, labels, num_classes=num_classes)
+            )
+            metrics = brats_dice_iou(pf, labels, num_classes=num_classes)
+            totals["loss"] += loss.item()
+            totals["dice"] += metrics["dice_mean"]
+            totals["iou"] += metrics["iou_mean"]
+            totals["dice_wt"] += metrics["dice_wt"]
+            totals["dice_tc"] += metrics["dice_tc"]
+            totals["dice_et"] += metrics["dice_et"]
+            totals["iou_wt"] += metrics["iou_wt"]
+            totals["iou_tc"] += metrics["iou_tc"]
+            totals["iou_et"] += metrics["iou_et"]
             total_batches += 1
     denom = max(total_batches, 1)
-    return {"dice": total_dice / denom, "iou": total_iou / denom}
+    return {k: v / denom for k, v in totals.items()}
 
 
 def fit(config: TrainingConfig) -> Dict[str, float]:
@@ -149,35 +174,74 @@ def fit(config: TrainingConfig) -> Dict[str, float]:
         history[epoch] = {"train_loss": train_stats["loss"], **val_stats}
         print(
             f"Epoch {epoch+1}/{config.num_epochs} | train_loss={train_stats['loss']:.4f} "
-            f"| val_dice={val_stats['dice']:.4f} | val_iou={val_stats['iou']:.4f}")
+            f"| val_loss={val_stats['loss']:.4f} | val_dice_mean={val_stats['dice']:.4f} "
+            f"| val_iou_mean={val_stats['iou']:.4f}"
+        )
     params = count_parameters(model)
     print(f"Trainable parameters: {params:,}")
     return history
 
 
-def save_history_plot(history: Dict[int, Dict[str, float]], plot_path: str) -> None:
+def save_history_plots(history: Dict[int, Dict[str, float]], plot_path: str) -> None:
     """将训练/验证指标可视化为折线图并保存。"""
 
     if not history:
         print("No history to plot.")
         return
     epochs = sorted(history.keys())
-    train_loss = [history[e]["train_loss"] for e in epochs]
-    val_dice = [history[e]["dice"] for e in epochs]
-    val_iou = [history[e]["iou"] for e in epochs]
 
+    def _collect(key: str) -> list[float]:
+        return [history[e][key] for e in epochs if key in history[e]]
+
+    base, ext = os.path.splitext(plot_path)
+    ext = ext if ext else ".png"
+
+    # 1) Dice 曲线：WT/TC/ET/Mean
     plt.figure(figsize=(8, 5))
-    plt.plot(epochs, train_loss, label="Train Loss")
-    plt.plot(epochs, val_dice, label="Val Dice")
-    plt.plot(epochs, val_iou, label="Val IoU")
+    plt.plot(epochs, _collect("dice_wt"), label="Dice WT")
+    plt.plot(epochs, _collect("dice_tc"), label="Dice TC")
+    plt.plot(epochs, _collect("dice_et"), label="Dice ET")
+    plt.plot(epochs, _collect("dice"), label="Dice Mean")
     plt.xlabel("Epoch")
-    plt.ylabel("Metric")
-    plt.title("ACANet Training Metrics")
+    plt.ylabel("Dice")
+    plt.title("Dice Curves (WT/TC/ET/Mean)")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(plot_path)
+    dice_path = f"{base}_dice{ext}"
+    plt.savefig(dice_path)
     plt.close()
-    print(f"Saved training curves to {plot_path}")
+
+    # 2) IoU 曲线：WT/TC/ET/Mean
+    plt.figure(figsize=(8, 5))
+    plt.plot(epochs, _collect("iou_wt"), label="IoU WT")
+    plt.plot(epochs, _collect("iou_tc"), label="IoU TC")
+    plt.plot(epochs, _collect("iou_et"), label="IoU ET")
+    plt.plot(epochs, _collect("iou"), label="IoU Mean")
+    plt.xlabel("Epoch")
+    plt.ylabel("IoU")
+    plt.title("IoU Curves (WT/TC/ET/Mean)")
+    plt.legend()
+    plt.tight_layout()
+    iou_path = f"{base}_iou{ext}"
+    plt.savefig(iou_path)
+    plt.close()
+
+    # 3) Loss 曲线：Train / Val
+    plt.figure(figsize=(8, 5))
+    plt.plot(epochs, _collect("train_loss"), label="Train Loss")
+    plt.plot(epochs, _collect("loss"), label="Val Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Loss Curves (Train vs Val)")
+    plt.legend()
+    plt.tight_layout()
+    loss_path = f"{base}_loss{ext}"
+    plt.savefig(loss_path)
+    plt.close()
+
+    print(f"Saved dice curves to {dice_path}")
+    print(f"Saved IoU curves to {iou_path}")
+    print(f"Saved loss curves to {loss_path}")
 
 
 def run_sanity_checks(
@@ -262,7 +326,7 @@ def main() -> None:  # pragma: no cover - CLI 入口
         run_sanity_checks(tmp_train_loader, tmp_model, torch.device(cfg["device"]), cfg["num_classes"], cfg["learning_rate"])
         del tmp_model, tmp_train_loader
     history = fit(train_cfg)
-    save_history_plot(history, cfg["plot_path"])
+    save_history_plots(history, cfg["plot_path"])
 
 
 if __name__ == "__main__":
