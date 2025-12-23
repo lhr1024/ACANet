@@ -139,6 +139,7 @@ def load_datasets(config: NpyDatasetConfig) -> Tuple[NpySegmentationDataset, Npy
         train_patients, val_patients = train_test_split(
             unique_patients, test_size=config.test_size, random_state=config.random_state
         )
+        print(f"[Data] Validation patient IDs: {sorted(val_patients)}")
         train_mask = np.array([pid in train_patients for pid in patient_ids])
         val_mask = ~train_mask
         train_x, val_x = images[train_mask], images[val_mask]
