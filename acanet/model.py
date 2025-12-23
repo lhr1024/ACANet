@@ -6,17 +6,23 @@
 3) 自适应上下文聚合 ACA：利用 P_H 引导对齐后的多模态特征融合，使用通道权重 w_1, w_2（公式 (1)、(2)）和多尺度卷积（公式 (3)、(4)）生成融合特征 F_i。
 4) 预测引导解码 PDS（含 PD）：使用 P_L 逐层引导解码融合特征 F_i，生成最终预测 P_f（公式 (7)、(8)）。
 
-为便于复现与测试，这里使用轻量卷积编码器替代原文的 PVTv2-B2，但保留双分支、ACA、PRE、PD 的设计思想与公式对应关系。
+默认使用 PVTv2-B2（ImageNet 预训练，依赖 timm），若未安装 timm 可切换为轻量卷积编码器作为回退，但仍保留双分支、ACA、PRE、PD 的设计思想与公式对应关系。
 输入假设为 (N, 4, H, W)，按论文分成两对模态：上支路 (T1, T1CE)，下支路 (T2, FLAIR)。
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Sequence
 
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
+
+try:
+    import timm  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    timm = None
 
 
 # ----------------------------- 基础模块 ----------------------------- #
@@ -47,10 +53,7 @@ class EncoderBlock(nn.Module):
 
 
 class SimpleEncoder(nn.Module):
-    """轻量级编码器（替代原文 PVTv2-B2，用于示意复现）。
-
-    返回四个尺度的特征列表 [F1, F2, F3, F4]，从浅到深。
-    """
+    """轻量级卷积编码器（当 timm 不可用时的回退），输出四个尺度的特征。"""
 
     def __init__(self, in_channels: int, base: int = 32):
         super().__init__()
@@ -67,6 +70,37 @@ class SimpleEncoder(nn.Module):
         f3, x = self.enc3(x)  # H/8
         f4, _ = self.enc4(x)  # H/16
         return [f1, f2, f3, f4]
+
+
+class PVTv2B2Encoder(nn.Module):
+    """PVTv2-B2 特征提取（需要 timm，支持本地权重文件或不加载预训练）。"""
+
+    def __init__(self, in_channels: int = 2, pretrained: bool = False, weights_path: str | None = None):
+        super().__init__()
+        if timm is None:
+            raise ImportError("timm is required for PVTv2-B2 encoder. Install timm>=0.9")
+        # features_only 提取四个 stage
+        self.backbone = timm.create_model(
+            "pvt_v2_b2",
+            pretrained=pretrained,
+            features_only=True,
+            out_indices=(0, 1, 2, 3),
+            in_chans=in_channels,
+        )
+        self.out_channels = self.backbone.feature_info.channels()
+        if weights_path:
+            state = torch.load(weights_path, map_location="cpu")
+            missing, unexpected = self.backbone.load_state_dict(state, strict=False)
+            if missing:
+                print(f"[PVTv2-B2] Missing keys when loading local weights: {missing}")
+            if unexpected:
+                print(f"[PVTv2-B2] Unexpected keys when loading local weights: {unexpected}")
+
+    def forward(self, x: Tensor) -> List[Tensor]:
+        feats = self.backbone(x)
+        if len(feats) != 4:
+            raise ValueError(f"PVTv2-B2 expected 4 feature maps, got {len(feats)}")
+        return feats
 
 
 # ----------------------------- 预测感知模块 ----------------------------- #
@@ -106,114 +140,101 @@ class PartialPredictionDecoder(nn.Module):
 
 
 class PREModule(nn.Module):
-    """Prediction-aware Region Exploration（公式 (5)、(6)）。
-
-    P_H = σ(P_a) + σ(P_d) / 2   （候选肿瘤区域，覆盖 WT）
-    P_L = |σ(P_a) - σ(P_d)|     （边界/不确定区域）
-    """
+    """Prediction-aware Region Exploration（公式 (5)、(6)），仅使用 WT/前景概率。"""
 
     def forward(self, pa: Tensor, pd: Tensor) -> tuple[Tensor, Tensor]:
-        pa_sig = torch.sigmoid(pa)
-        pd_sig = torch.sigmoid(pd)
-        ph = (pa_sig + pd_sig) / 2
-        pl = torch.abs(pa_sig - pd_sig)
+        # 使用 softmax 取背景通道 (0)，其余视为 WT 前景
+        pa_prob = torch.softmax(pa, dim=1)
+        pd_prob = torch.softmax(pd, dim=1)
+        pa_wt = 1 - pa_prob[:, :1]  # 前景概率
+        pd_wt = 1 - pd_prob[:, :1]
+        ph = (pa_wt + pd_wt) / 2
+        pl = torch.abs(pa_wt - pd_wt)
         return ph, pl
 
 
 # ----------------------------- ACA 模块 ----------------------------- #
 class ACAModule(nn.Module):
-    """自适应上下文聚合（公式 (1)-(4)）。
-
-    1) w1 = σ(conv3(F_u))，w2 = σ(conv3(F_d))            —— 公式 (1)、(2)
-    2) F̃ = w1 * F_u + w2 * F_d                          —— 融合权重
-    3) 多尺度空洞卷积抽取 F̃_u, F̃_d                     —— 公式 (3)、(4) 的 multi-scale conv
-    4) 拼接 [F̃_u * P_H, F̃_d * P_H, F̃] 后 3x3 卷积得到 F_i
-    """
+    """自适应上下文聚合（更贴近论文图 2 的多尺度加权实现）。"""
 
     def __init__(self, channels: int, dilations: Sequence[int] = (1, 3, 5, 7)):
         super().__init__()
         self.wu = nn.Sequential(nn.Conv2d(channels, channels, 3, padding=1, bias=False), nn.Sigmoid())
         self.wd = nn.Sequential(nn.Conv2d(channels, channels, 3, padding=1, bias=False), nn.Sigmoid())
-        self.ms_u = nn.ModuleList(
-            [nn.Conv2d(channels, channels, 3, padding=d, dilation=d, bias=False) for d in dilations]
+        self.ms = nn.ModuleList(
+            [nn.Sequential(nn.Conv2d(channels, channels, 3, padding=d, dilation=d, bias=False), nn.Sigmoid()) for d in dilations]
         )
-        self.ms_d = nn.ModuleList(
-            [nn.Conv2d(channels, channels, 3, padding=d, dilation=d, bias=False) for d in dilations]
-        )
-        self.fuse = ConvBNReLU(channels * 3, channels)
-
-    def _multi_scale(self, x: Tensor, convs: nn.ModuleList) -> Tensor:
-        feats = [conv(x) for conv in convs]
-        return sum(feats) / len(feats)
+        self.conv_ms_fuse = ConvBNReLU(channels * len(dilations), channels)
+        # 最终融合 Fu/Fd 与多尺度特征
+        self.conv_out = ConvBNReLU(channels * 3, channels)
 
     def forward(self, fu: Tensor, fd: Tensor, ph: Tensor) -> Tensor:
         if fu.numel() == 0 or fd.numel() == 0:
             raise ValueError("ACA 输入特征为空")
+
         # 权重 (1)(2)
         wu = self.wu(fu)
         wd = self.wd(fd)
-        f_tilde = wu * fu + wd * fd
+        f_prime = wu * fu + wd * fd  # F'
 
-        # 多尺度卷积 (3)(4)
-        fu_ms = self._multi_scale(fu, self.ms_u)
-        fd_ms = self._multi_scale(fd, self.ms_d)
+        # 多尺度卷积 + Sigmoid
+        ms_feats = [m(f_prime) for m in self.ms]
+        ms_concat = torch.cat(ms_feats, dim=1)
+        f_ms = self.conv_ms_fuse(ms_concat)  # F''
 
-        # 结合 P_H 引导，强调候选肿瘤区域
-        if ph.shape[-2:] != fu_ms.shape[-2:]:
-            ph = F.interpolate(ph, size=fu_ms.shape[-2:], mode="bilinear", align_corners=False)
-        ph_mask = ph.mean(dim=1, keepdim=True)  # 将类别引导映射到单通道权重
-        fu_guided = fu_ms * ph_mask
-        fd_guided = fd_ms * ph_mask
+        # PH 引导到与特征同尺寸的单通道 mask
+        if ph.shape[-2:] != f_ms.shape[-2:]:
+            ph = F.interpolate(ph, size=f_ms.shape[-2:], mode="bilinear", align_corners=False)
+        ph_mask = ph.mean(dim=1, keepdim=True)
 
-        fused = torch.cat([fu_guided, fd_guided, f_tilde], dim=1)
-        return self.fuse(fused)
+        guided_u = f_ms * fu * ph_mask
+        guided_d = f_ms * fd * ph_mask
+        fused = torch.cat([guided_u, guided_d, f_ms], dim=1)
+        return self.conv_out(fused)
 
 
 # ----------------------------- 预测引导解码 PDS ----------------------------- #
 class PredictionGuidedDecoder(nn.Module):
-    """使用 P_L 逐层解码融合特征（对应公式 (7)、(8) 思路简化实现），支持四个尺度。"""
+    """使用 P_L 逐层解码融合特征（更贴近图 5 的逐级组件形式）。"""
 
     def __init__(self, channels: Sequence[int], num_classes: int):
         super().__init__()
         if len(channels) != 4:
             raise ValueError(f"PredictionGuidedDecoder expects 4 scales, got {len(channels)}")
         c1, c2, c3, c4 = channels
-        self.conv4 = ConvBNReLU(c4, c4)
-        self.up4 = nn.ConvTranspose2d(c4, c3, 2, 2)
-        self.conv3 = ConvBNReLU(c3 * 2, c3)
-        self.up3 = nn.ConvTranspose2d(c3, c2, 2, 2)
-        self.pl2_proj = ConvBNReLU(1, c2, kernel_size=1)  # 将单通道 PL 映射到与特征同通道数
-        self.conv2 = ConvBNReLU(c2 * 2, c2)  # concat PL 引导
-        self.up2 = nn.ConvTranspose2d(c2, c1, 2, 2)
-        self.pl1_proj = ConvBNReLU(1, c1, kernel_size=1)
-        self.conv1 = ConvBNReLU(c1 * 2, c1)
+        self.conv3 = ConvBNReLU(c4, c3)
+        self.conv2 = ConvBNReLU(c3, c2)
+        self.conv1 = ConvBNReLU(c2, c1)
+        self.proj_pl3 = ConvBNReLU(1, c4, kernel_size=1)
+        self.proj_pl2 = ConvBNReLU(1, c3, kernel_size=1)
+        self.proj_pl1 = ConvBNReLU(1, c2, kernel_size=1)
         self.classifier = nn.Conv2d(c1, num_classes, kernel_size=1)
 
+    def _resize_pl(self, pl: Tensor, size: Sequence[int]) -> Tensor:
+        return F.interpolate(pl, size=size, mode="bilinear", align_corners=False)
+
     def forward(self, feats: List[Tensor], pl: Tensor) -> Tensor:
-        f1, f2, f3, f4 = feats
-        x = self.conv4(f4)
-        x = self.up4(x)
-        if x.shape[-2:] != f3.shape[-2:]:
-            x = F.interpolate(x, size=f3.shape[-2:], mode="bilinear", align_corners=False)
-        x = self.conv3(torch.cat([x, f3], dim=1))
+        f1, f2, f3, f4 = feats  # f1:最高分辨率
 
-        x = self.up3(x)
-        if x.shape[-2:] != f2.shape[-2:]:
-            x = F.interpolate(x, size=f2.shape[-2:], mode="bilinear", align_corners=False)
-        pl2 = F.interpolate(pl, size=f2.shape[-2:], mode="bilinear", align_corners=False)
-        # 将多通道 PL 先通道平均为单通道，再投影到与特征通道一致
-        pl2 = pl2.mean(dim=1, keepdim=True)
-        pl2 = self.pl2_proj(pl2)
-        x = self.conv2(torch.cat([x, pl2], dim=1))
+        # C3: 使用 F4 作为 D4
+        pl3 = self.proj_pl3(self._resize_pl(pl, f4.shape[-2:]).mean(dim=1, keepdim=True))
+        d3_input = (f4 * pl3 + f4)
+        d3 = self.conv3(d3_input)
+        d3 = F.interpolate(d3, size=f3.shape[-2:], mode="bilinear", align_corners=False) * f3
 
-        x = self.up2(x)
-        if x.shape[-2:] != f1.shape[-2:]:
-            x = F.interpolate(x, size=f1.shape[-2:], mode="bilinear", align_corners=False)
-        pl1 = F.interpolate(pl, size=f1.shape[-2:], mode="bilinear", align_corners=False)
-        pl1 = pl1.mean(dim=1, keepdim=True)
-        pl1 = self.pl1_proj(pl1)
-        x = self.conv1(torch.cat([x, pl1], dim=1))
-        return self.classifier(x)
+        # C2
+        pl2 = self.proj_pl2(self._resize_pl(pl, f3.shape[-2:]).mean(dim=1, keepdim=True))
+        d2_input = (d3 * pl2 + d3)
+        d2 = self.conv2(d2_input)
+        d2 = F.interpolate(d2, size=f2.shape[-2:], mode="bilinear", align_corners=False) * f2
+
+        # C1
+        pl1 = self.proj_pl1(self._resize_pl(pl, f2.shape[-2:]).mean(dim=1, keepdim=True))
+        d1_input = (d2 * pl1 + d2)
+        d1 = self.conv1(d1_input)
+        d1 = F.interpolate(d1, size=f1.shape[-2:], mode="bilinear", align_corners=False) * f1
+
+        return self.classifier(d1)
 
 
 # ----------------------------- 配置 ----------------------------- #
@@ -223,6 +244,9 @@ class ACANetConfig:
     num_classes: int = 4  # WT/TC/ET/背景
     base_channels: int = 32
     dilations: Sequence[int] = (1, 3, 5, 7)
+    use_pvt: bool = True
+    pretrained_backbone: bool = False
+    pvt_weights_path: str | None = None
 
     def validate(self) -> None:
         if self.in_channels < 4:
@@ -233,6 +257,8 @@ class ACANetConfig:
             raise ValueError("base_channels 必须为正")
         if len(self.dilations) == 0:
             raise ValueError("dilations 不能为空")
+        if self.pvt_weights_path is not None and not os.path.exists(self.pvt_weights_path):
+            raise FileNotFoundError(f"pvt_weights_path not found: {self.pvt_weights_path}")
 
 
 # ----------------------------- 主模型 ----------------------------- #
@@ -272,21 +298,33 @@ class ACANet(nn.Module):
         ch = config.base_channels
 
         # 双分支编码
-        self.encoder_up = SimpleEncoder(in_channels=2, base=ch)
-        self.encoder_down = SimpleEncoder(in_channels=2, base=ch)
+        if config.use_pvt:
+            if timm is None:
+                raise ImportError("timm is required when use_pvt=True. Install timm>=0.9 or set use_pvt=False.")
+            self.encoder_up = PVTv2B2Encoder(
+                in_channels=2, pretrained=config.pretrained_backbone, weights_path=config.pvt_weights_path
+            )
+            self.encoder_down = PVTv2B2Encoder(
+                in_channels=2, pretrained=config.pretrained_backbone, weights_path=config.pvt_weights_path
+            )
+            channels = self.encoder_up.out_channels
+        else:
+            self.encoder_up = SimpleEncoder(in_channels=2, base=ch)
+            self.encoder_down = SimpleEncoder(in_channels=2, base=ch)
+            channels = [ch, ch * 2, ch * 4, ch * 8]
 
         # 部分解码器（生成 Pa, Pd）
-        channels = [ch, ch * 2, ch * 4, ch * 8]
         self.ppd_up = PartialPredictionDecoder(channels, num_classes=config.num_classes)
         self.ppd_down = PartialPredictionDecoder(channels, num_classes=config.num_classes)
 
         # ACA 多尺度融合（逐层）
-        self.aca1 = ACAModule(ch, config.dilations)
-        self.aca2 = ACAModule(ch * 2, config.dilations)
-        self.aca3 = ACAModule(ch * 4, config.dilations)
-        self.aca4 = ACAModule(ch * 8, config.dilations)
+        self.aca1 = ACAModule(channels[0], config.dilations)
+        self.aca2 = ACAModule(channels[1], config.dilations)
+        self.aca3 = ACAModule(channels[2], config.dilations)
+        self.aca4 = ACAModule(channels[3], config.dilations)
 
-        # 预测引导解码
+        # PRE & 预测引导解码
+        self.pre = PREModule()
         self.pd = PredictionGuidedDecoder(channels, num_classes=config.num_classes)
 
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
@@ -309,8 +347,8 @@ class ACANet(nn.Module):
         pa = self.ppd_up(feats_up)
         pd = self.ppd_down(feats_down)
 
-        # PRE 生成 P_H, P_L
-        ph, pl = PREModule()(pa, pd)
+        # PRE 生成 P_H, P_L（仅使用前景/WT 概率）
+        ph, pl = self.pre(pa, pd)
 
         # ACA 融合多模态特征（逐层对应公式 (1)-(4)）
         f1 = self.aca1(feats_up[0], feats_down[0], ph)
