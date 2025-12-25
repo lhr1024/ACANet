@@ -62,13 +62,39 @@ class PVTv2B2Encoder(nn.Module):
                     raw = raw["state_dict"]
                 elif "model" in raw:
                     raw = raw["model"]
-            # 去掉可能的前缀（如 backbone.）
-            cleaned = {}
-            for k, v in raw.items():
-                new_k = k
-                if new_k.startswith("backbone."):
-                    new_k = new_k[len("backbone.") :]
-                cleaned[new_k] = v
+
+            def _remap_key(key: str) -> str:
+                new_key = key
+                if new_key.startswith("backbone."):
+                    new_key = new_key[len("backbone.") :]
+                if new_key.startswith("patch_embed1."):
+                    new_key = "patch_embed." + new_key[len("patch_embed1.") :]
+                elif new_key.startswith("patch_embed2."):
+                    new_key = "stages_1.downsample." + new_key[len("patch_embed2.") :]
+                elif new_key.startswith("patch_embed3."):
+                    new_key = "stages_2.downsample." + new_key[len("patch_embed3.") :]
+                elif new_key.startswith("patch_embed4."):
+                    new_key = "stages_3.downsample." + new_key[len("patch_embed4.") :]
+                elif new_key.startswith("block1."):
+                    new_key = "stages_0.blocks." + new_key[len("block1.") :]
+                elif new_key.startswith("block2."):
+                    new_key = "stages_1.blocks." + new_key[len("block2.") :]
+                elif new_key.startswith("block3."):
+                    new_key = "stages_2.blocks." + new_key[len("block3.") :]
+                elif new_key.startswith("block4."):
+                    new_key = "stages_3.blocks." + new_key[len("block4.") :]
+                elif new_key.startswith("norm1."):
+                    new_key = "stages_0.norm." + new_key[len("norm1.") :]
+                elif new_key.startswith("norm2."):
+                    new_key = "stages_1.norm." + new_key[len("norm2.") :]
+                elif new_key.startswith("norm3."):
+                    new_key = "stages_2.norm." + new_key[len("norm3.") :]
+                elif new_key.startswith("norm4."):
+                    new_key = "stages_3.norm." + new_key[len("norm4.") :]
+                new_key = new_key.replace(".mlp.dwconv.dwconv.", ".mlp.dwconv.")
+                return new_key
+
+            cleaned = {_remap_key(k): v for k, v in raw.items()}
             # 仅保留模型存在的键
             model_keys = set(self.backbone.state_dict().keys())
             filtered = {k: v for k, v in cleaned.items() if k in model_keys}
@@ -76,8 +102,8 @@ class PVTv2B2Encoder(nn.Module):
             unexpected_keys = set(cleaned.keys()) - model_keys
             load_result = self.backbone.load_state_dict(filtered, strict=False)
             print(
-                f"[PVTv2-B2] Loaded {len(load_result.missing_keys)}/{len(model_keys)} backbone keys "
-                f"from local weights (after filtering)."
+                f"[PVTv2-B2] Loaded {len(model_keys) - len(load_result.missing_keys)}/{len(model_keys)} "
+                f"backbone keys from local weights (after remap/filter)."
             )
             if missing_keys:
                 print(f"[PVTv2-B2] Missing keys (not provided in weights): {sorted(list(missing_keys))[:10]} ...")
