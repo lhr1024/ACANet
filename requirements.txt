@@ -11,3 +11,5 @@ rich>=13.7
 tqdm>=4.66
 matplotlib>=3.8
 nibabel>=5.2
+# Backbone (PVTv2-B2) for feature extraction
+timm>=0.9
