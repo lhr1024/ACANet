@@ -6,17 +6,18 @@
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
 import torch
-from torch import Tensor, nn
+from torch import nn
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
 
 from .data import NpyDatasetConfig, load_datasets
-from .metrics import dice_coefficient, dice_loss, iou_score
+from .metrics import brats_dice_iou, dice_loss
 from .model import ACANet, ACANetConfig, count_parameters
 
 
@@ -29,17 +30,31 @@ CONFIG_BLOCK = {
     "features": DEFAULT_FEATURES_PATH,
     "labels": DEFAULT_LABELS_PATH,
     # 训练超参
-    "batch_size": 4,
-    "epochs": 50,
-    "learning_rate": 1e-3,
+    "batch_size": 12,
+    "epochs": 100,
+    "learning_rate": 1e-2,
+    "poly_power": 0.9,
+    "warmup_epochs": 10,
     "num_workers": 0,
     # 模型配置
     "num_classes": 4,
     "base_channels": 32,
+    # 损失权重配置
+    "loss_weights": {
+        "pa": 0.2,
+        "pd": 0.2,
+        "pf": 1.0,
+    },
+    "loss_class_weights": [1.0, 1.5, 2.0, 2.0],  # background, WT, TC, ET
     # 设备（GPU 环境下设置为 "cuda"，若无 GPU 可改为 "cpu"）
     "device": "cuda",
     # 指标曲线保存路径
     "plot_path": "training_metrics.png",
+    # 本地 PVTv2-B2 预训练权重路径（如无则留空）
+    "pvt_weights_path": "/LHRP/ACANet/acanet/pvt_v2_b2.pth",
+    # 每隔多少轮保存一次权重（None 则不保存）
+    "checkpoint_interval": 5,
+    "checkpoint_dir": "checkpoints",
     # 是否在训练前做快速有效性检查（数据量、batch、标签分布、loss 是否下降）
     "sanity_check": True,
     # 是否在训练过程中打印详细诊断信息（每 N 个 batch）
@@ -54,8 +69,14 @@ class TrainingConfig:
     batch_size: int = 4
     num_epochs: int = 3
     learning_rate: float = 1e-3
+    poly_power: float = 0.9
+    warmup_epochs: int = 0
     num_workers: int = 0
     device: str = "cpu"
+    checkpoint_interval: int | None = None
+    checkpoint_dir: str | None = None
+    loss_weights: dict[str, float] | None = None
+    loss_class_weights: list[float] | None = None
 
     def validate(self) -> None:
         if self.batch_size <= 0:
@@ -64,6 +85,12 @@ class TrainingConfig:
             raise ValueError("num_epochs must be positive")
         if self.learning_rate <= 0:
             raise ValueError("learning_rate must be positive")
+        if self.checkpoint_interval is not None and self.checkpoint_interval <= 0:
+            raise ValueError("checkpoint_interval must be positive when set")
+        if self.poly_power <= 0:
+            raise ValueError("poly_power must be positive")
+        if self.warmup_epochs < 0:
+            raise ValueError("warmup_epochs must be >= 0")
 
 
 def create_dataloaders(config: TrainingConfig) -> Tuple[DataLoader, DataLoader]:
@@ -78,7 +105,13 @@ def create_dataloaders(config: TrainingConfig) -> Tuple[DataLoader, DataLoader]:
 
 
 def train_one_epoch(
-    model: nn.Module, optimizer: torch.optim.Optimizer, loader: DataLoader, device: torch.device, num_classes: int
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    loader: DataLoader,
+    device: torch.device,
+    num_classes: int,
+    loss_weights: dict[str, float] | None = None,
+    class_weights: Tensor | None = None,
 ) -> Dict[str, float]:
     model.train()
     total_loss = 0.0
@@ -96,10 +129,11 @@ def train_one_epoch(
             pd = nn.functional.interpolate(pd, size=labels.shape[-2:], mode="bilinear", align_corners=False)
             pf = nn.functional.interpolate(pf, size=labels.shape[-2:], mode="bilinear", align_corners=False)
         # 混合损失：对 Pa、Pd、Pf 分别计算 Dice+CE，累加
+        lw = loss_weights or {"pa": 1.0, "pd": 1.0, "pf": 1.0}
         loss = (
-            dice_loss(pa, labels, num_classes=num_classes)
-            + dice_loss(pd, labels, num_classes=num_classes)
-            + dice_loss(pf, labels, num_classes=num_classes)
+            lw.get("pa", 1.0) * dice_loss(pa, labels, num_classes=num_classes, class_weights=class_weights)
+            + lw.get("pd", 1.0) * dice_loss(pd, labels, num_classes=num_classes, class_weights=class_weights)
+            + lw.get("pf", 1.0) * dice_loss(pf, labels, num_classes=num_classes, class_weights=class_weights)
         )
         loss.backward()
         optimizer.step()
@@ -118,21 +152,45 @@ def train_one_epoch(
 
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, num_classes: int) -> Dict[str, float]:
     model.eval()
-    total_dice = 0.0
-    total_iou = 0.0
+    totals = {
+        "loss": 0.0,
+        "dice": 0.0,
+        "iou": 0.0,
+        "dice_wt": 0.0,
+        "dice_tc": 0.0,
+        "dice_et": 0.0,
+        "iou_wt": 0.0,
+        "iou_tc": 0.0,
+        "iou_et": 0.0,
+    }
     total_batches = 0
     with torch.no_grad():
         for images, labels in loader:
             images, labels = images.to(device), labels.to(device)
             outputs = model(images)
-            pf = outputs["pf"]
+            pa, pd, pf = outputs["pa"], outputs["pd"], outputs["pf"]
             if pf.shape[-2:] != labels.shape[-2:]:
+                pa = nn.functional.interpolate(pa, size=labels.shape[-2:], mode="bilinear", align_corners=False)
+                pd = nn.functional.interpolate(pd, size=labels.shape[-2:], mode="bilinear", align_corners=False)
                 pf = nn.functional.interpolate(pf, size=labels.shape[-2:], mode="bilinear", align_corners=False)
-            total_dice += dice_coefficient(pf, labels, num_classes=num_classes).item()
-            total_iou += iou_score(pf, labels, num_classes=num_classes).item()
+            loss = (
+                dice_loss(pa, labels, num_classes=num_classes)
+                + dice_loss(pd, labels, num_classes=num_classes)
+                + dice_loss(pf, labels, num_classes=num_classes)
+            )
+            metrics = brats_dice_iou(pf, labels, num_classes=num_classes)
+            totals["loss"] += loss.item()
+            totals["dice"] += metrics["dice_mean"]
+            totals["iou"] += metrics["iou_mean"]
+            totals["dice_wt"] += metrics["dice_wt"]
+            totals["dice_tc"] += metrics["dice_tc"]
+            totals["dice_et"] += metrics["dice_et"]
+            totals["iou_wt"] += metrics["iou_wt"]
+            totals["iou_tc"] += metrics["iou_tc"]
+            totals["iou_et"] += metrics["iou_et"]
             total_batches += 1
     denom = max(total_batches, 1)
-    return {"dice": total_dice / denom, "iou": total_iou / denom}
+    return {k: v / denom for k, v in totals.items()}
 
 
 def fit(config: TrainingConfig) -> Dict[str, float]:
@@ -140,44 +198,117 @@ def fit(config: TrainingConfig) -> Dict[str, float]:
     device = torch.device(config.device)
     train_loader, val_loader = create_dataloaders(config)
     model = ACANet(config.model).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+    class_weights = None
+    if config.loss_class_weights:
+        class_weights = torch.tensor(config.loss_class_weights, dtype=torch.float32, device=device)
+    optimizer = torch.optim.SGD(model.parameters(), lr=config.learning_rate, momentum=0.9)
+    base_lr = config.learning_rate
+
+    if config.checkpoint_dir:
+        os.makedirs(config.checkpoint_dir, exist_ok=True)
 
     history = {}
     for epoch in range(config.num_epochs):
-        train_stats = train_one_epoch(model, optimizer, train_loader, device, num_classes=config.model.num_classes)
+        train_stats = train_one_epoch(
+            model,
+            optimizer,
+            train_loader,
+            device,
+            num_classes=config.model.num_classes,
+            loss_weights=config.loss_weights,
+            class_weights=class_weights,
+        )
         val_stats = evaluate(model, val_loader, device, num_classes=config.model.num_classes)
         history[epoch] = {"train_loss": train_stats["loss"], **val_stats}
-        print(
-            f"Epoch {epoch+1}/{config.num_epochs} | train_loss={train_stats['loss']:.4f} "
-            f"| val_dice={val_stats['dice']:.4f} | val_iou={val_stats['iou']:.4f}")
+        metrics_msg = (
+            f"Epoch {epoch+1}/{config.num_epochs} | "
+            f"train_loss={train_stats['loss']:.4f} | val_loss={val_stats['loss']:.4f} | "
+            f"dice_wt={val_stats['dice_wt']:.4f} | dice_tc={val_stats['dice_tc']:.4f} | "
+            f"dice_et={val_stats['dice_et']:.4f} | dice={val_stats['dice']:.4f} | "
+            f"iou_wt={val_stats['iou_wt']:.4f} | iou_tc={val_stats['iou_tc']:.4f} | "
+            f"iou_et={val_stats['iou_et']:.4f} | iou={val_stats['iou']:.4f}"
+        )
+        print(metrics_msg)
+        # Poly learning rate decay
+        if epoch < config.warmup_epochs:
+            warmup_factor = (epoch + 1) / max(config.warmup_epochs, 1)
+            new_lr = base_lr * warmup_factor
+        else:
+            progress = (epoch + 1 - config.warmup_epochs) / max(config.num_epochs - config.warmup_epochs, 1)
+            lr_factor = (1 - progress) ** config.poly_power
+            new_lr = base_lr * lr_factor
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = new_lr
+        print(f"[LR] Set learning rate to {new_lr:.6f}")
+        if config.checkpoint_interval and (epoch + 1) % config.checkpoint_interval == 0:
+            ckpt_path = os.path.join(config.checkpoint_dir or "", f"checkpoint_epoch_{epoch+1}.pth")
+            torch.save(model.state_dict(), ckpt_path)
+            print(f"Saved checkpoint to {ckpt_path}")
     params = count_parameters(model)
     print(f"Trainable parameters: {params:,}")
     return history
 
 
-def save_history_plot(history: Dict[int, Dict[str, float]], plot_path: str) -> None:
+def save_history_plots(history: Dict[int, Dict[str, float]], plot_path: str) -> None:
     """将训练/验证指标可视化为折线图并保存。"""
 
     if not history:
         print("No history to plot.")
         return
     epochs = sorted(history.keys())
-    train_loss = [history[e]["train_loss"] for e in epochs]
-    val_dice = [history[e]["dice"] for e in epochs]
-    val_iou = [history[e]["iou"] for e in epochs]
 
+    def _collect(key: str) -> list[float]:
+        return [history[e][key] for e in epochs if key in history[e]]
+
+    base, ext = os.path.splitext(plot_path)
+    ext = ext if ext else ".png"
+
+    # 1) Dice 曲线：WT/TC/ET/Mean
     plt.figure(figsize=(8, 5))
-    plt.plot(epochs, train_loss, label="Train Loss")
-    plt.plot(epochs, val_dice, label="Val Dice")
-    plt.plot(epochs, val_iou, label="Val IoU")
+    plt.plot(epochs, _collect("dice_wt"), label="Dice WT")
+    plt.plot(epochs, _collect("dice_tc"), label="Dice TC")
+    plt.plot(epochs, _collect("dice_et"), label="Dice ET")
+    plt.plot(epochs, _collect("dice"), label="Dice Mean")
     plt.xlabel("Epoch")
-    plt.ylabel("Metric")
-    plt.title("ACANet Training Metrics")
+    plt.ylabel("Dice")
+    plt.title("Dice Curves (WT/TC/ET/Mean)")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(plot_path)
+    dice_path = f"{base}_dice{ext}"
+    plt.savefig(dice_path)
     plt.close()
-    print(f"Saved training curves to {plot_path}")
+
+    # 2) IoU 曲线：WT/TC/ET/Mean
+    plt.figure(figsize=(8, 5))
+    plt.plot(epochs, _collect("iou_wt"), label="IoU WT")
+    plt.plot(epochs, _collect("iou_tc"), label="IoU TC")
+    plt.plot(epochs, _collect("iou_et"), label="IoU ET")
+    plt.plot(epochs, _collect("iou"), label="IoU Mean")
+    plt.xlabel("Epoch")
+    plt.ylabel("IoU")
+    plt.title("IoU Curves (WT/TC/ET/Mean)")
+    plt.legend()
+    plt.tight_layout()
+    iou_path = f"{base}_iou{ext}"
+    plt.savefig(iou_path)
+    plt.close()
+
+    # 3) Loss 曲线：Train / Val
+    plt.figure(figsize=(8, 5))
+    plt.plot(epochs, _collect("train_loss"), label="Train Loss")
+    plt.plot(epochs, _collect("loss"), label="Val Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Loss Curves (Train vs Val)")
+    plt.legend()
+    plt.tight_layout()
+    loss_path = f"{base}_loss{ext}"
+    plt.savefig(loss_path)
+    plt.close()
+
+    print(f"Saved dice curves to {dice_path}")
+    print(f"Saved IoU curves to {iou_path}")
+    print(f"Saved loss curves to {loss_path}")
 
 
 def run_sanity_checks(
@@ -244,15 +375,27 @@ def build_dataset_config(features: str | None, labels: str | None) -> NpyDataset
 def main() -> None:  # pragma: no cover - CLI 入口
     cfg = CONFIG_BLOCK
     dataset_cfg = build_dataset_config(cfg["features"], cfg["labels"])
-    model_cfg = ACANetConfig(in_channels=4, num_classes=cfg["num_classes"], base_channels=cfg["base_channels"])
+    model_cfg = ACANetConfig(
+        in_channels=4,
+        num_classes=cfg["num_classes"],
+        base_channels=cfg["base_channels"],
+        pvt_weights_path=cfg.get("pvt_weights_path"),
+        pretrained_backbone=cfg.get("pretrained_backbone", False),
+    )
     train_cfg = TrainingConfig(
         dataset=dataset_cfg,
         model=model_cfg,
         batch_size=cfg["batch_size"],
         num_epochs=cfg["epochs"],
         learning_rate=cfg["learning_rate"],
+        poly_power=cfg["poly_power"],
+        warmup_epochs=cfg.get("warmup_epochs", 0),
         num_workers=cfg["num_workers"],
         device=cfg["device"],
+        checkpoint_interval=cfg.get("checkpoint_interval"),
+        checkpoint_dir=cfg.get("checkpoint_dir"),
+        loss_weights=cfg.get("loss_weights"),
+        loss_class_weights=cfg.get("loss_class_weights"),
     )
     # 可选的快速有效性检查
     history = {}
@@ -262,7 +405,7 @@ def main() -> None:  # pragma: no cover - CLI 入口
         run_sanity_checks(tmp_train_loader, tmp_model, torch.device(cfg["device"]), cfg["num_classes"], cfg["learning_rate"])
         del tmp_model, tmp_train_loader
     history = fit(train_cfg)
-    save_history_plot(history, cfg["plot_path"])
+    save_history_plots(history, cfg["plot_path"])
 
 
 if __name__ == "__main__":
