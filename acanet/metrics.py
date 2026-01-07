@@ -80,15 +80,14 @@ def brats_region_masks(one_hot_labels: Tensor) -> Dict[str, Tensor]:
     wt = one_hot_labels[:, 1:4].sum(dim=1, keepdim=True)  # WT = 1|2|3
     tc = one_hot_labels[:, (1, 3)].sum(dim=1, keepdim=True)  # TC = 1|3
     et = one_hot_labels[:, 3:4]  # ET = 3
-    return {"wt": wt.clamp(max=1), "tc": tc.clamp(max=1), "et": et.clamp(max=1)}
+    return {"wt": wt, "tc": tc, "et": et}
 
 
 def brats_dice_iou(pred: Tensor, target: Tensor, num_classes: int, epsilon: float = 1e-6) -> Dict[str, float]:
-    """计算 WT/TC/ET 以及平均 Dice/IoU。"""
-    pred_classes = torch.argmax(pred, dim=1)
-    pred_oh = _one_hot(pred_classes, num_classes)
+    """计算 WT/TC/ET 以及平均 Dice/IoU（使用 softmax 概率进行软指标计算）。"""
+    pred_probs = torch.softmax(pred, dim=1)
     tgt_oh = _one_hot(target, num_classes)
-    pred_masks = brats_region_masks(pred_oh)
+    pred_masks = brats_region_masks(pred_probs)
     tgt_masks = brats_region_masks(tgt_oh)
 
     def _binary_dice(pred_mask: Tensor, tgt_mask: Tensor) -> Tensor:
